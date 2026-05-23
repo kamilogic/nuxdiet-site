@@ -1,0 +1,163 @@
+name: CI/CD — NuxDiet
+
+# Dispara em push e pull request para a branch main
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Variáveis globais reutilizadas em todos os jobs
+env:
+  AWS_REGION: us-east-1
+  S3_BUCKET: nuxdiet-static-site
+  TF_VERSION: "1.7.0"
+
+jobs:
+
+  # ─────────────────────────────────────────────────────────
+  # JOB 1 — VALIDATE
+  # Roda em TODO push e PR. Não precisa de credenciais AWS.
+  # Objetivo: falhar rápido se o código ou o Terraform estiver errado.
+  # ─────────────────────────────────────────────────────────
+  validate:
+    name: "1 · Validar código"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout — baixa o código do repositório
+        uses: actions/checkout@v4
+
+      - name: Verificar estrutura de arquivos HTML
+        run: |
+          echo "=== Arquivos do site ==="
+          ls -la src/
+          test -f src/index.html || (echo "ERRO: index.html não encontrado" && exit 1)
+          test -f src/style.css  || (echo "ERRO: style.css não encontrado"  && exit 1)
+          grep -q "<!DOCTYPE html>" src/index.html || (echo "ERRO: DOCTYPE ausente" && exit 1)
+          grep -q "<title>"         src/index.html || (echo "ERRO: tag title ausente" && exit 1)
+          echo "✅ HTML válido"
+
+      - name: Setup Terraform — instala a CLI no runner Linux
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false   # necessário para capturar outputs limpos depois
+
+      - name: Terraform fmt — verifica formatação dos arquivos .tf
+        run: terraform fmt -check -recursive
+        working-directory: terraform
+
+      - name: Terraform init — sem backend (só para validação, sem AWS)
+        run: terraform init -backend=false
+        working-directory: terraform
+
+      - name: Terraform validate — valida sintaxe e lógica dos arquivos .tf
+        run: terraform validate
+        working-directory: terraform
+
+
+  # ─────────────────────────────────────────────────────────
+  # JOB 2 — INFRA
+  # Roda APENAS em push para main (não em PRs).
+  # Provisiona ou atualiza a infra AWS via Terraform.
+  # ─────────────────────────────────────────────────────────
+  infra:
+    name: "2 · Provisionar infraestrutura (Terraform)"
+    runs-on: ubuntu-latest
+    needs: validate   # só roda se o job validate passar
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    # Expõe o ID do CloudFront para o job deploy usar
+    outputs:
+      cloudfront_id: ${{ steps.tf_output.outputs.cloudfront_id }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciais AWS
+        # Injeta AWS_ACCESS_KEY_ID e AWS_SECRET_ACCESS_KEY como variáveis de ambiente
+        # Os valores vêm dos Secrets do repositório — nunca ficam expostos nos logs
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Cache do estado Terraform
+        # O terraform.tfstate registra o que já foi criado na AWS.
+        # O cache persiste esse arquivo entre execuções do pipeline.
+        # Sem isso, o Terraform tentaria recriar tudo a cada push.
+        uses: actions/cache@v4
+        with:
+          path: terraform/terraform.tfstate
+          key: terraform-state-main
+          restore-keys: terraform-state-
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform init — baixa o provider AWS no runner
+        run: terraform init
+        working-directory: terraform
+
+      - name: Terraform plan — mostra o que será criado/alterado (sem aplicar)
+        run: terraform plan -lock=false
+        working-directory: terraform
+
+      - name: Terraform apply — cria ou atualiza a infra na AWS
+        # -auto-approve: não pede confirmação interativa (necessário em CI)
+        # -lock=false: desativa o lock de estado (ok pois só um pipeline roda por vez)
+        run: terraform apply -auto-approve -lock=false
+        working-directory: terraform
+
+      - name: Capturar outputs do Terraform
+        id: tf_output
+        run: |
+          echo "cloudfront_id=$(terraform output -raw cloudfront_id)" >> $GITHUB_OUTPUT
+        working-directory: terraform
+
+
+  # ─────────────────────────────────────────────────────────
+  # JOB 3 — DEPLOY
+  # Roda após o job infra. Envia os arquivos do site para o S3
+  # e invalida o cache do CloudFront para o site atualizar.
+  # ─────────────────────────────────────────────────────────
+  deploy:
+    name: "3 · Deploy do site para S3"
+    runs-on: ubuntu-latest
+    needs: infra   # garante que a infra existe antes de fazer o deploy
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Sincronizar arquivos com S3
+        # --delete: remove do S3 arquivos que não existem mais localmente
+        # --cache-control: instrui o CloudFront a cachear por 1 hora
+        run: |
+          aws s3 sync src/ s3://${{ env.S3_BUCKET }}/ \
+            --delete \
+            --cache-control "max-age=3600"
+          echo "✅ Arquivos enviados para S3"
+
+      - name: Invalidar cache do CloudFront
+        # Força o CloudFront a buscar os arquivos novos do S3
+        # sem isso, o site antigo ficaria em cache por até 1 hora
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ needs.infra.outputs.cloudfront_id }} \
+            --paths "/*"
+          echo "✅ Cache invalidado — site atualizado"
